@@ -182,7 +182,11 @@ jobs:
 
             # Push the new branch
             echo "Pushing cherry-pick branch..."
-            git push origin "$CHERRY_PICK_BRANCH"
+            if ! git push origin "$CHERRY_PICK_BRANCH" 2>&1; then
+              echo "❌ ERROR: Failed to push branch '$CHERRY_PICK_BRANCH' to remote."
+              echo "This might be due to missing 'workflow' scope on the token when modifying workflow files."
+              exit 1
+            fi
 
             # Create pull request
             echo "Creating pull request..."
@@ -197,12 +201,21 @@ jobs:
             } > /tmp/pr-body.md
 
             # Create pull request with original PR content
-            gh pr create \
+            PR_URL=$(gh pr create \
               --repo ${{ github.repository }} \
               --base "$TARGET_BRANCH" \
               --head "$CHERRY_PICK_BRANCH" \
               --title "[cherry-pick: $TARGET_BRANCH] $PR_TITLE" \
-              --body-file /tmp/pr-body.md
+              --body-file /tmp/pr-body.md 2>&1)
+
+            if [ $? -ne 0 ]; then
+              echo "❌ ERROR: Failed to create pull request."
+              echo "Output: $PR_URL"
+              exit 1
+            fi
+
+            echo "Created PR: $PR_URL"
+            echo "new_pr_url=$PR_URL" >> $GITHUB_OUTPUT
 
             echo "✅ Cherry-pick completed successfully!"
           } 2>&1 | tee "$OUTPUT_FILE"
@@ -243,6 +256,8 @@ jobs:
             ✅ **Cherry-pick to `${{ matrix.branch }}` successful!**
 
             A new pull request has been created to cherry-pick this change to `${{ matrix.branch }}`.
+
+            **PR**: ${{ steps.cherry-pick.outputs.new_pr_url }}
 
             Please review and merge the cherry-pick PR.
 

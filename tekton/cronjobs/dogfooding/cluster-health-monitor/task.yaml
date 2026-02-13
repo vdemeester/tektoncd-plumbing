@@ -1,0 +1,245 @@
+# Copyright 2026 The Tekton Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: cluster-health-monitor
+  namespace: default
+spec:
+  description: >
+    Monitors the health of CronJobs, Jobs, PipelineRuns, and TaskRuns
+    in the dogfooding cluster and reports issues.
+  params:
+    - name: namespaces
+      description: Comma-separated list of namespaces to monitor for PipelineRun/TaskRun failures
+      type: string
+      default: "default,tekton-ci,tekton-nightly,bastion-p,bastion-z"
+    - name: job-stuck-threshold-minutes
+      description: Minutes after which an active job is considered stuck
+      type: string
+      default: "120"
+    - name: lookback-hours
+      description: Hours to look back for PipelineRun/TaskRun failures
+      type: string
+      default: "25"
+  workspaces:
+    - name: report
+      description: Workspace to share the health report between steps
+  steps:
+    - name: check-cronjobs-and-jobs
+      image: ghcr.io/tektoncd/plumbing/kubectl
+      script: |
+        #!/bin/sh
+        set -e
+
+        REPORT_FILE="$(workspaces.report.path)/health-report.md"
+        STATUS_FILE="$(workspaces.report.path)/status"
+        echo "healthy" > "${STATUS_FILE}"
+
+        echo "# Cluster Health Report" > "${REPORT_FILE}"
+        echo "" >> "${REPORT_FILE}"
+        echo "**Generated:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "${REPORT_FILE}"
+        echo "" >> "${REPORT_FILE}"
+
+        # =========================================================
+        # 1. Check CronJobs
+        # =========================================================
+        echo "## CronJob Health" >> "${REPORT_FILE}"
+        echo "" >> "${REPORT_FILE}"
+
+        CRONJOB_ISSUES=""
+
+        # Check for suspended cronjobs
+        SUSPENDED=$(kubectl get cronjobs -n default -o jsonpath='{range .items[?(@.spec.suspend==true)]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+        if [ -n "${SUSPENDED}" ]; then
+          CRONJOB_ISSUES="${CRONJOB_ISSUES}\n### Suspended CronJobs\n\n"
+          for cj in ${SUSPENDED}; do
+            CRONJOB_ISSUES="${CRONJOB_ISSUES}- \`${cj}\`\n"
+          done
+          CRONJOB_ISSUES="${CRONJOB_ISSUES}\n"
+        fi
+
+        # Check for cronjobs with stuck active jobs (concurrencyPolicy=Forbid blocks new runs)
+        STUCK_CJS=""
+        for cj in $(kubectl get cronjobs -n default -o jsonpath='{range .items[?(@.status.active)]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+          POLICY=$(kubectl get cronjob "${cj}" -n default -o jsonpath='{.spec.concurrencyPolicy}' 2>/dev/null)
+          LAST_SUCCESS=$(kubectl get cronjob "${cj}" -n default -o jsonpath='{.status.lastSuccessfulTime}' 2>/dev/null)
+          LAST_SCHEDULE=$(kubectl get cronjob "${cj}" -n default -o jsonpath='{.status.lastScheduleTime}' 2>/dev/null)
+          STUCK_CJS="${STUCK_CJS}- \`${cj}\` (policy: ${POLICY}, last success: ${LAST_SUCCESS:-never}, last scheduled: ${LAST_SCHEDULE:-never})\n"
+          echo "unhealthy" > "${STATUS_FILE}"
+        done
+
+        if [ -n "${STUCK_CJS}" ]; then
+          CRONJOB_ISSUES="${CRONJOB_ISSUES}### CronJobs with Active (Stuck) Jobs\n\n"
+          CRONJOB_ISSUES="${CRONJOB_ISSUES}These cronjobs have active jobs that haven't completed. If \`concurrencyPolicy=Forbid\`, no new runs can be scheduled.\n\n"
+          CRONJOB_ISSUES="${CRONJOB_ISSUES}${STUCK_CJS}\n"
+        fi
+
+        if [ -z "${CRONJOB_ISSUES}" ]; then
+          echo "✅ All CronJobs healthy" >> "${REPORT_FILE}"
+        else
+          printf "%b" "${CRONJOB_ISSUES}" >> "${REPORT_FILE}"
+        fi
+        echo "" >> "${REPORT_FILE}"
+
+        # =========================================================
+        # 2. Check Jobs
+        # =========================================================
+        echo "## Job Health" >> "${REPORT_FILE}"
+        echo "" >> "${REPORT_FILE}"
+
+        JOB_ISSUES=""
+
+        # Check for pods in ImagePullBackOff
+        PULL_FAILURES=$(kubectl get pods -n default --field-selector=status.phase!=Succeeded,status.phase!=Running -o custom-columns='POD:.metadata.name,STATUS:.status.containerStatuses[0].state.waiting.reason,IMAGE:.spec.containers[0].image' --no-headers 2>/dev/null | grep -i "ImagePull\|ErrImage" || true)
+        if [ -n "${PULL_FAILURES}" ]; then
+          JOB_ISSUES="${JOB_ISSUES}### Pods with Image Pull Failures\n\n"
+          JOB_ISSUES="${JOB_ISSUES}\`\`\`\n${PULL_FAILURES}\n\`\`\`\n\n"
+          echo "unhealthy" > "${STATUS_FILE}"
+        fi
+
+        # Check for failed jobs
+        FAILED_JOBS=$(kubectl get jobs -n default -o custom-columns='NAME:.metadata.name,FAILED:.status.failed,CREATED:.metadata.creationTimestamp' --no-headers 2>/dev/null | awk '$2 > 0 {print}' || true)
+        if [ -n "${FAILED_JOBS}" ]; then
+          JOB_ISSUES="${JOB_ISSUES}### Failed Jobs\n\n"
+          JOB_ISSUES="${JOB_ISSUES}\`\`\`\n${FAILED_JOBS}\n\`\`\`\n\n"
+          echo "unhealthy" > "${STATUS_FILE}"
+        fi
+
+        if [ -z "${JOB_ISSUES}" ]; then
+          echo "✅ All Jobs healthy" >> "${REPORT_FILE}"
+        else
+          printf "%b" "${JOB_ISSUES}" >> "${REPORT_FILE}"
+        fi
+        echo "" >> "${REPORT_FILE}"
+
+        echo "=== CronJob/Job check complete ==="
+        cat "${REPORT_FILE}"
+
+    - name: check-pipelineruns-taskruns
+      image: ghcr.io/tektoncd/plumbing/tkn
+      env:
+        - name: NAMESPACES
+          value: "$(params.namespaces)"
+      script: |
+        #!/bin/sh
+        set -e
+
+        REPORT_FILE="$(workspaces.report.path)/health-report.md"
+        STATUS_FILE="$(workspaces.report.path)/status"
+
+        # =========================================================
+        # 3. Check PipelineRuns and TaskRuns
+        # =========================================================
+        echo "## PipelineRun / TaskRun Health" >> "${REPORT_FILE}"
+        echo "" >> "${REPORT_FILE}"
+
+        PR_TR_ISSUES=""
+
+        for ns in $(echo "${NAMESPACES}" | tr ',' ' '); do
+          # Check failed PipelineRuns (tkn lists most recent first)
+          FAILED_PRS=$(tkn pr list -n "${ns}" --no-headers 2>/dev/null | grep -i "Failed" | head -20 || true)
+          if [ -n "${FAILED_PRS}" ]; then
+            PR_TR_ISSUES="${PR_TR_ISSUES}### Failed PipelineRuns in \`${ns}\`\n\n"
+            PR_TR_ISSUES="${PR_TR_ISSUES}\`\`\`\n${FAILED_PRS}\n\`\`\`\n\n"
+            echo "unhealthy" > "${STATUS_FILE}"
+          fi
+
+          # Check failed TaskRuns (standalone, not owned by a PipelineRun)
+          FAILED_TRS=$(tkn tr list -n "${ns}" --no-headers 2>/dev/null | grep -i "Failed" | head -20 || true)
+          if [ -n "${FAILED_TRS}" ]; then
+            PR_TR_ISSUES="${PR_TR_ISSUES}### Failed TaskRuns in \`${ns}\`\n\n"
+            PR_TR_ISSUES="${PR_TR_ISSUES}\`\`\`\n${FAILED_TRS}\n\`\`\`\n\n"
+            echo "unhealthy" > "${STATUS_FILE}"
+          fi
+        done
+
+        if [ -z "${PR_TR_ISSUES}" ]; then
+          echo "✅ No recent PipelineRun/TaskRun failures" >> "${REPORT_FILE}"
+        else
+          printf "%b" "${PR_TR_ISSUES}" >> "${REPORT_FILE}"
+        fi
+        echo "" >> "${REPORT_FILE}"
+
+        # =========================================================
+        # Summary
+        # =========================================================
+        STATUS=$(cat "${STATUS_FILE}")
+        echo "---" >> "${REPORT_FILE}"
+        echo "" >> "${REPORT_FILE}"
+        echo "**Overall Status:** ${STATUS}" >> "${REPORT_FILE}"
+
+        echo "=== Full report ==="
+        cat "${REPORT_FILE}"
+        echo ""
+        echo "Status: ${STATUS}"
+
+    - name: report
+      image: ghcr.io/tektoncd/plumbing/kubectl
+      env:
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: bot-token-github
+              key: bot-token
+      script: |
+        #!/bin/sh
+        set -e
+
+        REPORT_FILE="$(workspaces.report.path)/health-report.md"
+        STATUS_FILE="$(workspaces.report.path)/status"
+        STATUS=$(cat "${STATUS_FILE}")
+
+        if [ "${STATUS}" = "healthy" ]; then
+          echo "✅ Cluster is healthy, no issue to create."
+          exit 0
+        fi
+
+        echo "⚠️  Cluster unhealthy, checking for existing open issue..."
+
+        # Check if there's already an open monitoring issue
+        EXISTING=$(wget -q -O- \
+          --header="Authorization: token ${GITHUB_TOKEN}" \
+          --header="Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/repos/tektoncd/plumbing/issues?labels=area/infra,kind/monitoring&state=open&per_page=1" \
+          | grep -c '"title"' || true)
+
+        if [ "${EXISTING}" -gt 0 ]; then
+          echo "ℹ️  An open monitoring issue already exists. Skipping creation."
+          exit 0
+        fi
+
+        TITLE="[Cluster Health Monitor] Issues detected on $(date -u '+%Y-%m-%d')"
+
+        # Build JSON payload
+        BODY=$(cat "${REPORT_FILE}")
+        FULL_BODY=$(printf '## Automated Cluster Health Report\n\n%s\n\n---\n*This issue was automatically created by the cluster-health-monitor Task.*\n*To resolve, investigate the issues above and close this issue when fixed.*' "${BODY}")
+
+        # Use a temp file for the JSON payload to handle special characters
+        PAYLOAD_FILE="/tmp/payload.json"
+        printf '{"title": "%s", "body": ' "${TITLE}" > "${PAYLOAD_FILE}"
+        # Escape the body for JSON using sed
+        printf '%s' "${FULL_BODY}" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g' | awk '{printf "%s\\n", $0}' | sed 's/^/"/; s/$/"/' >> "${PAYLOAD_FILE}"
+        printf ', "labels": ["area/infra", "kind/monitoring"]}' >> "${PAYLOAD_FILE}"
+
+        echo "Creating GitHub issue..."
+        wget -q -O- --post-file="${PAYLOAD_FILE}" \
+          --header="Authorization: token ${GITHUB_TOKEN}" \
+          --header="Accept: application/vnd.github.v3+json" \
+          --header="Content-Type: application/json" \
+          "https://api.github.com/repos/tektoncd/plumbing/issues" \
+          | head -5
+
+        echo ""
+        echo "✅ GitHub issue created."

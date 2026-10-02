@@ -1,0 +1,98 @@
+# .github/workflows/update-tekton-cd-versions.yml
+#
+# Bumps pinned upstream release versions in tekton/cd/*/kustomization.yaml
+# (Tekton Pipelines, Triggers, Chains, Results, Pipelines-as-Code) to the
+# latest available release, one commit per component, and opens/updates a
+# single PR with the result.
+#
+# Runs weekly and can be triggered manually.
+
+name: Update Tekton CD versions
+
+on:
+  schedule:
+    # Run weekly on Monday at 9am UTC
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run - log available bumps without making changes'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  update-versions:
+    name: Update component versions
+    # Only run in the upstream repo, not in forks (secrets won't be available)
+    if: github.repository == 'tektoncd/plumbing'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Generate token
+        id: generate_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PROJECT_SYNC_APP_ID }}
+          private-key: ${{ secrets.PROJECT_SYNC_PRIVATE_KEY }}
+          owner: tektoncd
+
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          token: ${{ steps.generate_token.outputs.token }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "tekton-robot"
+          git config user.email "tekton-robot@google.com"
+
+      - name: Create working branch
+        if: inputs.dry_run != 'true'
+        run: git checkout -b update-tekton-cd-versions
+
+      - name: Bump component versions
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          ./scripts/update-tekton-cd-versions.sh ${{ inputs.dry_run == 'true' && '--dry-run' || '' }} | tee /tmp/bump.log
+
+      - name: Job summary
+        run: |
+          {
+            echo "## Tekton CD version check"
+            echo '```'
+            cat /tmp/bump.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push branch and open/update PR
+        if: inputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          # Nothing to do if the script made no commits.
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ]; then
+            echo "All components up to date, nothing to do."
+            exit 0
+          fi
+
+          git push -f origin update-tekton-cd-versions:update-tekton-cd-versions
+
+          if gh pr view update-tekton-cd-versions --json number >/dev/null 2>&1; then
+            echo "PR already exists, branch updated."
+            exit 0
+          fi
+
+          gh pr create \
+            --head update-tekton-cd-versions \
+            --title "Update tekton-oracle component versions" \
+            --body-file .github/pr-body/update-tekton-cd-versions.md \
+            --label "ok-to-test" \
+            --label "dependencies" \
+            --label "release-note-none" \
+            --label "kind/misc"
